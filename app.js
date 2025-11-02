@@ -1,141 +1,183 @@
-// app.js - copy this whole file and save as app.js
+require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
-const SQLiteStore = require('connect-sqlite3')(session);
 const bcrypt = require('bcrypt');
+const { Pool } = require('pg');
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
-const fs = require('fs');
-require('dotenv').config();
-
-const PORT = process.env.PORT || 3000;
-const SESSION_SECRET = process.env.SESSION_SECRET || 'devsecret';
-const DB_FILE = process.env.DB_FILE || './data/inventory.db';
-
-// ensure data folder exists
-if (!fs.existsSync(path.dirname(DB_FILE))) fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
-
-// open sqlite DB
-const db = new sqlite3.Database(DB_FILE, (err) => {
-  if (err) console.error('DB open error', err);
-});
-
-// create tables if not exist
-const initSql = `
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  sku TEXT,
-  quantity INTEGER DEFAULT 0,
-  location TEXT,
-  notes TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);`;
-db.exec(initSql, (e) => { if (e) console.error('DB init error', e); });
-
-// ensure an admin user exists (username: admin / password: admin123) - only if users table empty
-db.get('SELECT COUNT(*) AS cnt FROM users', [], async (err, row) => {
-  if (!err && row && row.cnt === 0) {
-    const hash = await bcrypt.hash('admin123', 10);
-    db.run('INSERT INTO users (username, password_hash) VALUES (?, ?)', ['admin', hash]);
-    console.log('Created demo admin user -> username: admin password: admin123');
-  }
-});
+const bodyParser = require('body-parser');
 
 const app = express();
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.use(express.urlencoded({ extended: false }));
-app.use(express.static(path.join(__dirname, 'public')));
+const PORT = process.env.PORT || 3000;
 
-app.use(session({
-  store: new SQLiteStore({ db: 'sessions.sqlite', dir: './data' }),
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { maxAge: 1000 * 60 * 60 * 4 }
-}));
-
-app.use((req, res, next) => {
-  res.locals.currentUser = req.session.user || null;
-  next();
+// Postgres connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-function requireLogin(req, res, next) {
+// Middleware
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'secret123',
+  resave: false,
+  saveUninitialized: true
+}));
+
+// Helper DB query function
+async function dbQuery(text, params) {
+  const res = await pool.query(text, params);
+  return res;
+}
+
+// Initialize tables and demo admin
+(async () => {
+  try {
+    await dbQuery(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await dbQuery(`
+      CREATE TABLE IF NOT EXISTS items (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        sku TEXT,
+        quantity INTEGER DEFAULT 0,
+        location TEXT,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create demo admin if no users exist
+    const res = await dbQuery('SELECT COUNT(*) AS cnt FROM users');
+    if (res.rows && Number(res.rows[0].cnt) === 0) {
+      const hash = await bcrypt.hash('admin123', 10);
+      await dbQuery('INSERT INTO users (username, password_hash) VALUES ($1, $2)', ['admin', hash]);
+      console.log('Created demo admin: username=admin, password=admin123');
+    }
+  } catch (err) {
+    console.error('Error initializing DB:', err);
+  }
+})();
+
+// Middleware to check login
+function checkAuth(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
   next();
 }
 
-app.get('/', (req, res) => res.redirect('/dashboard'));
+// Routes
+app.get('/', (req, res) => res.redirect('/login'));
 
+// Login
 app.get('/login', (req, res) => res.render('login', { error: null }));
-app.post('/login', (req, res) => {
+app.post('/login', async (req, res) => {
   const { username, password } = req.body;
-  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, row) => {
-    if (err || !row) return res.render('login', { error: 'Invalid credentials' });
-    const ok = await bcrypt.compare(password, row.password_hash);
-    if (!ok) return res.render('login', { error: 'Invalid credentials' });
-    req.session.user = { id: row.id, username: row.username };
-    res.redirect('/dashboard');
-  });
+  try {
+    const r = await dbQuery('SELECT * FROM users WHERE username=$1', [username]);
+    const user = r.rows[0];
+    if (user && await bcrypt.compare(password, user.password_hash)) {
+      req.session.user = { id: user.id, username: user.username };
+      res.redirect('/dashboard');
+    } else {
+      res.render('login', { error: 'Invalid credentials' });
+    }
+  } catch (err) {
+    console.error(err);
+    res.render('login', { error: 'Server error' });
+  }
 });
 
-app.get('/register', (req, res) => res.render('register', { error: null }));
-app.post('/register', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.render('register', { error: 'Required' });
-  const hash = await bcrypt.hash(password, 10);
-  db.run('INSERT INTO users (username, password_hash) VALUES (?, ?)', [username, hash], function(err) {
-    if (err) return res.render('register', { error: 'Username taken' });
-    req.session.user = { id: this.lastID, username };
-    res.redirect('/dashboard');
-  });
-});
-
+// Logout
 app.get('/logout', (req, res) => {
-  req.session.destroy(() => res.redirect('/login'));
+  req.session.destroy();
+  res.redirect('/login');
 });
 
-app.get('/dashboard', requireLogin, (req, res) => {
-  db.get('SELECT COUNT(*) as cnt FROM items', [], (err, row) => {
-    const total = row ? row.cnt : 0;
-    res.render('dashboard', { total });
-  });
+// Dashboard
+app.get('/dashboard', checkAuth, async (req, res) => {
+  try {
+    const r = await dbQuery('SELECT COUNT(*) AS total FROM items');
+    res.render('dashboard', { total: r.rows[0].total, currentUser: req.session.user });
+  } catch (err) {
+    console.error(err);
+    res.send('Server error');
+  }
 });
 
-app.get('/items', requireLogin, (req, res) => {
-  db.all('SELECT * FROM items ORDER BY created_at DESC', [], (err, rows) => {
-    res.render('inventory_list', { items: rows || [] });
-  });
+// Items list
+app.get('/items', checkAuth, async (req, res) => {
+  try {
+    const r = await dbQuery('SELECT * FROM items ORDER BY id DESC');
+    res.render('inventory_list', { items: r.rows, currentUser: req.session.user });
+  } catch (err) {
+    console.error(err);
+    res.send('Server error');
+  }
 });
 
-app.get('/items/new', requireLogin, (req, res) => res.render('inventory_form', { item: null, action: '/items/new' }));
-app.post('/items/new', requireLogin, (req, res) => {
+// Add new item form
+app.get('/items/new', checkAuth, (req, res) => {
+  res.render('inventory_form', { item: null, action: '/items/new', currentUser: req.session.user });
+});
+
+// Add new item POST
+app.post('/items/new', checkAuth, async (req, res) => {
   const { name, sku, quantity, location, notes } = req.body;
-  db.run('INSERT INTO items (name, sku, quantity, location, notes) VALUES (?, ?, ?, ?, ?)', [name, sku, Number(quantity)||0, location, notes], () => res.redirect('/items'));
+  try {
+    await dbQuery('INSERT INTO items (name, sku, quantity, location, notes) VALUES ($1,$2,$3,$4,$5)', [name, sku, quantity, location, notes]);
+    res.redirect('/items');
+  } catch (err) {
+    console.error(err);
+    res.send('Server error');
+  }
 });
 
-app.get('/items/:id/edit', requireLogin, (req, res) => {
-  db.get('SELECT * FROM items WHERE id = ?', [req.params.id], (err, row) => {
-    if (!row) return res.redirect('/items');
-    res.render('inventory_form', { item: row, action: `/items/${row.id}/edit` });
-  });
+// Edit item form
+app.get('/items/:id/edit', checkAuth, async (req, res) => {
+  try {
+    const r = await dbQuery('SELECT * FROM items WHERE id=$1', [req.params.id]);
+    const item = r.rows[0];
+    res.render('inventory_form', { item, action: `/items/${req.params.id}/edit`, currentUser: req.session.user });
+  } catch (err) {
+    console.error(err);
+    res.send('Server error');
+  }
 });
-app.post('/items/:id/edit', requireLogin, (req, res) => {
+
+// Edit item POST
+app.post('/items/:id/edit', checkAuth, async (req, res) => {
   const { name, sku, quantity, location, notes } = req.body;
-  db.run('UPDATE items SET name=?, sku=?, quantity=?, location=?, notes=? WHERE id=?', [name, sku, Number(quantity)||0, location, notes, req.params.id], () => res.redirect('/items'));
+  try {
+    await dbQuery('UPDATE items SET name=$1, sku=$2, quantity=$3, location=$4, notes=$5 WHERE id=$6', [name, sku, quantity, location, notes, req.params.id]);
+    res.redirect('/items');
+  } catch (err) {
+    console.error(err);
+    res.send('Server error');
+  }
 });
 
-app.post('/items/:id/delete', requireLogin, (req, res) => {
-  db.run('DELETE FROM items WHERE id = ?', [req.params.id], () => res.redirect('/items'));
+// Delete item
+app.post('/items/:id/delete', checkAuth, async (req, res) => {
+  try {
+    await dbQuery('DELETE FROM items WHERE id=$1', [req.params.id]);
+    res.redirect('/items');
+  } catch (err) {
+    console.error(err);
+    res.send('Server error');
+  }
 });
 
+// Start server
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
+
